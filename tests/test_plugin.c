@@ -20,6 +20,7 @@
 #include "media-codecs.h"
 #include "rtp.h"
 #include "ssc.h"
+#include "pipewire/a2dp-codec-ssc.h"
 
 static int failures;
 
@@ -35,6 +36,8 @@ static int failures;
 #define NFRAMES 40
 #define WARMUP 8
 #define DELAY 108
+#define CONGESTED 100000
+#define SOCKET_FULL -1
 
 /* what BlueZ reports for the vendor endpoint of the Buds3 Pro: vendor 0x75, codec 0x0103, config byte 0x3e */
 static const uint8_t buds_caps[7] = { 0x75, 0x00, 0x00, 0x00, 0x03, 0x01, 0x3e };
@@ -51,6 +54,16 @@ static void make_signal(int16_t *pcm, int frames, int rate)
 		pcm[2 * n] = (int16_t)l;
 		pcm[2 * n + 1] = (int16_t)r;
 	}
+}
+
+static int preset_of_frame(int frame_bytes)
+{
+	int p;
+
+	for (p = SSC_PRESET_88K; p <= SSC_PRESET_229K; p++)
+		if (ssc_frame_bytes(p) == frame_bytes)
+			return p;
+	return -1;
 }
 
 static struct spa_audio_info make_info(int rate, uint32_t format)
@@ -215,6 +228,90 @@ int main(int argc, char **argv)
 		enc = codec->init(codec, 0, config, 7, &bad, NULL, 895);
 		CHECK(enc == NULL, "a format the codec does not take must be refused");
 		CHECK(codec->init(codec, 0, config, 7, &(struct spa_audio_info){ 0 }, NULL, 100) == NULL, "garbage info must be refused");
+	}
+	{
+		static const struct { const char *step; int calls; long unsent; int frame; uint8_t info; } steps[] = {
+			{ "start", 0, 0, 576, 0xf4 },
+			{ "empty queue at the top", SSC_ABR_INCREASE_HOLD, 0, 576, 0xf4 },
+			{ "queue at the limit", 1, 3 * (12 + 576), 576, 0xf4 },
+			{ "queue over the limit skips 192k", 1, 3 * (12 + 576) + 1, 324, 0xf2 },
+			{ "congested during the cooldown", SSC_ABR_REDUCE_COOLDOWN - 1, CONGESTED, 324, 0xf2 },
+			{ "congested after the cooldown", 1, CONGESTED, 244, 0xf1 },
+			{ "congested", SSC_ABR_REDUCE_COOLDOWN, CONGESTED, 224, 0xf0 },
+			{ "congested at the floor", SSC_ABR_REDUCE_COOLDOWN, CONGESTED, 224, 0xf0 },
+			{ "empty queue before the hold", SSC_ABR_INCREASE_HOLD - 1, 0, 224, 0xf0 },
+			{ "queue above one packet", 1, 12 + 224 + 1, 224, 0xf0 },
+			{ "one packet in flight before the hold", SSC_ABR_INCREASE_HOLD - 1, 12 + 224, 224, 0xf0 },
+			{ "one packet in flight after the hold", 1, 12 + 224, 244, 0xf1 },
+			{ "empty queue before the hold", SSC_ABR_INCREASE_HOLD - 1, 0, 244, 0xf1 },
+			{ "socket full", 1, SOCKET_FULL, 224, 0xf0 },
+			{ "empty queue before the hold", SSC_ABR_INCREASE_HOLD - 1, 0, 224, 0xf0 },
+			{ "empty queue after the hold", 1, 0, 244, 0xf1 },
+			{ "empty queue after the hold", SSC_ABR_INCREASE_HOLD, 0, 324, 0xf2 },
+			{ "empty queue after the hold skips 192k", SSC_ABR_INCREASE_HOLD, 0, 576, 0xf4 },
+		};
+		struct spa_audio_info info = make_info(48000, SPA_AUDIO_FORMAT_S16);
+		void *enc = codec->init(codec, 0, config, 7, &info, NULL, 895);
+		int16_t *pcm = malloc(sizeof(int16_t) * 2 * SSC_FRAME_SAMPLES);
+		int celt_err = 0;
+		OpusCustomMode *mode = opus_custom_mode_create(44100, SSC_FRAME_SAMPLES, &celt_err);
+		OpusCustomDecoder *dec = opus_custom_decoder_create(mode, 2, &celt_err);
+		float dec_out[2 * SSC_FRAME_SAMPLES];
+
+		CHECK(enc != NULL && codec->abr_process != NULL && codec->reduce_bitpool != NULL, "the codec must adapt its bitrate");
+		CHECK(codec->increase_bitpool == NULL, "the bitrate must go up only from the queue size");
+		if (enc && codec->abr_process && codec->reduce_bitpool) {
+			opus_custom_decoder_ctl(dec, CELT_SET_SIGNALLING(0));
+			make_signal(pcm, 1, 48000);
+			for (size_t s = 0; s < sizeof(steps) / sizeof(steps[0]); s++) {
+				uint8_t packet[1024];
+				size_t out = 0;
+				int flush, hdr, bitrate = 0;
+
+				for (i = 0; i < steps[s].calls; i++)
+					bitrate = steps[s].unsent == SOCKET_FULL ? codec->reduce_bitpool(enc) : codec->abr_process(enc, (size_t)steps[s].unsent);
+				CHECK(steps[s].calls == 0 || bitrate == ssc_preset_bitrate(preset_of_frame(steps[s].frame)),
+				      "step %zu (%s): returned %d", s, steps[s].step, bitrate);
+				hdr = codec->start_encode(enc, packet, sizeof(packet), (uint16_t)s, 864u * s);
+				codec->encode(enc, pcm, SSC_FRAME_SAMPLES * 4, packet + hdr, sizeof(packet) - hdr, &out, &flush);
+				CHECK((int)out == steps[s].frame && packet[hdr + 3] == steps[s].info,
+				      "step %zu (%s): %zu byte frame, info %02x (expected %d, %02x)", s, steps[s].step, out, packet[hdr + 3], steps[s].frame, steps[s].info);
+				CHECK(opus_custom_decode_float(dec, packet + hdr + SSC_HEADER_SIZE, (int)out - SSC_HEADER_SIZE, dec_out, SSC_FRAME_SAMPLES) == SSC_FRAME_SAMPLES,
+				      "step %zu: frame does not decode", s);
+			}
+		}
+		if (enc)
+			codec->deinit(enc);
+		opus_custom_decoder_destroy(dec);
+		opus_custom_mode_destroy(mode);
+		free(pcm);
+	}
+	{
+		struct spa_audio_info info = make_info(48000, SPA_AUDIO_FORMAT_S16);
+		int16_t *pcm = calloc(2 * SSC_FRAME_SAMPLES, sizeof(int16_t));
+		void *enc;
+		uint8_t packet[1024];
+		size_t out = 0;
+		int flush, hdr;
+
+		setenv("SSC_PRESET", "192k", 1);
+		enc = codec->init(codec, 0, config, 7, &info, NULL, 895);
+		unsetenv("SSC_PRESET");
+		CHECK(enc != NULL, "init with SSC_PRESET=192k");
+		if (enc && codec->abr_process) {
+			hdr = codec->start_encode(enc, packet, sizeof(packet), 0, 0);
+			codec->encode(enc, pcm, SSC_FRAME_SAMPLES * 4, packet + hdr, sizeof(packet) - hdr, &out, &flush);
+			CHECK(out == 484, "SSC_PRESET=192k: starts with %zu byte frames", out);
+			CHECK(codec->abr_process(enc, CONGESTED) == 128000, "SSC_PRESET=192k: congestion must step down to 128k");
+			for (i = 0; i < SSC_ABR_INCREASE_HOLD; i++)
+				codec->abr_process(enc, 0);
+			hdr = codec->start_encode(enc, packet, sizeof(packet), 1, 864);
+			codec->encode(enc, pcm, SSC_FRAME_SAMPLES * 4, packet + hdr, sizeof(packet) - hdr, &out, &flush);
+			CHECK(out == 484, "SSC_PRESET=192k: must climb back to the 192k ceiling, got %zu byte frames", out);
+		}
+		if (enc)
+			codec->deinit(enc);
+		free(pcm);
 	}
 	/* UHQ variant: 96 kHz, two 9 ms frames per packet */
 	{

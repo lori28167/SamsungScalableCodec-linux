@@ -197,8 +197,8 @@ Main-core functions: frame validation `0x0c0af1e4`, `preparse_packet` `0x0c0af2f
 - The host loads codec plugins from a hard-coded list (`codec-loader.c`: aac aptx faststream ldac sbc lc3plus opus opus-g lc3 g722 hfp-*). The plugin therefore occupies the `aptx` slot
   (libspa-codec-bluez5-aptx.so, factory `api.codec.bluez5.media.aptx`) and uses id `APTX_HD` for ordering (index 2 of the host's list: above AAC). `LC3PLUS_HR` would sit below AAC.
   The proper long-term route is adding an `ssc` entry upstream in PipeWire.
-- Plugin behaviour: stereo S16 only; configuration = one sample-rate bit (48 kHz preferred) plus the sink's bit 3 echoed back (as Samsung's stack does); preset 229k unless the L2CAP MTU is too small
-  (RTP 12 B + frame must fit); one frame per packet; RTP payload type 96, SSRC 1; flags nibble written as 1.
+- Plugin behaviour: stereo S16 only; configuration = one sample-rate bit (48 kHz preferred) plus the sink's bit 3 echoed back (as Samsung's stack does); starts at preset 229k unless the L2CAP MTU is too small
+  (RTP 12 B + frame must fit), then adapts the preset to the socket queue (see the 2026-11-09 section); one frame per packet; RTP payload type 96, SSRC 1; flags nibble written as 1.
 - Verified on hardware (Galaxy Buds3 Pro, 2026-10-30, Fedora 44, PipeWire 1.6.10): the Buds accept configuration byte 0x18 (48 kHz), the node runs with codec `ssc`, 48 kHz S16 stereo and
   no underruns, with the flags nibble fixed at 1 and the RTP marker bit 0, at the default preset (229k unless the MTU forces a lower one). Still unknown: 44.1 kHz (0x28) and the other presets on the
   sink, and what the 2-bit high-band hint does there.
@@ -291,3 +291,25 @@ If it recurs (environment, not this repo):
   happened with WirePlumber at debug level 5 and btmon running and are not reproduced since. Cause still unknown (link/RF, or Buds-side).
 - Kernel log: the Realtek controller does full USB resets (`usb 2-3: reset full-speed USB device`) with firmware reload about every 13 hours,
   unrelated to the drop times.
+
+## 2026-11-09: Galaxy Buds2 Pro, the 192k preset and bitrate adaptation
+Setup: Galaxy Buds2 Pro (Modalias `v0075pA013d0001`), CachyOS, PipeWire 1.6.10, WirePlumber 0.5.18, BlueZ 5.87, Intel AX210. Report in issue #1.
+- Capability byte `0x3c` (44.1 + 48 kHz, bit 3, bit 2 HiFi; no 96 kHz bit, so no `ssc_uhq` profile). Configuration `0x18` is accepted, as on the Buds3 Pro.
+- Presets heard on these Buds, each fixed for the whole stream (`SSC_PRESET`, plugin without adaptation): 229k, 128k, 96k and 88k sound right;
+  **192k sounds wrong** ("strange" for as long as it plays, back to normal when the preset changes). The table above shows Samsung's encoder writing
+  flags nibble `d` at 192k and 229k and `1` below; we always write `1`. Tested and ruled out: `main` changed to code 19 bands at 192k
+  (`CELT_SET_END_BAND(19)`) and write nibble `d`, as Samsung's encoder does, still sounds wrong at fixed 192k on the Buds2 Pro.
+- Stutters at 229k: with WirePlumber at debug level each one is a burst of `send_buffer: Resource temporarily unavailable` (socket full, packets dropped)
+  plus `reduce bitpool: 0`, the host asking the codec for a lower bitrate and the plugin having none. No xruns in the graph, no Wi-Fi scan or BlueZ event at those times.
+- The host (`media-sink.c`) calls `reduce_bitpool` only after a failed send, at most every 0.5 s, and skips it when its once-a-second check ran less than
+  0.5 s before; one drop at 18:52:46 got no reduction for that reason. `abr_process(unsent)` is called before every packet with the bytes still in the
+  socket, which lets the codec act before the socket fills (LDAC uses it).
+- Queue at 229k on a healthy link, per 556 packets (about 10 s): empty 86-94% of the time, at most 2 packets (1176 bytes). It also reaches 2 packets
+  at 192k and 128k, so "queue empty" alone almost never lasts 10 s; one packet in flight has to count as healthy.
+- The plugin now implements `abr_process`: more than 3 packets queued steps down (at most once per 28 packets, about 0.5 s), at most one packet queued
+  for 556 packets in a row steps up, `reduce_bitpool` steps down on a full socket. 192k is skipped both ways unless `SSC_PRESET=192k` makes it the ceiling.
+  A first version stepped down above 2 packets: in 32 minutes on a clean link it went 229k -> 128k about 40 times, nearly always at exactly 3 packets
+  (1764 bytes), and spent about a quarter of the time at 128k. `SO_SNDBUF` is 5432 bytes (`FILL_FRAMES` 4 x MTU 679, doubled by the kernel), and at fixed
+  229k the queue reached 3 packets about once a minute with a single drop in 15 minutes, so 3 packets is normal jitter; the limit is now more than 3.
+- Heard on the Buds2 Pro: none of those ~80 changes between 229k, 128k, 96k and 88k was audible. Walking away from the PC took it 229k -> 128k -> 96k -> 88k
+  within 8 s, and back to 229k 10 s per step after returning.

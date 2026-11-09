@@ -30,6 +30,7 @@
 #include "rtp.h"
 #include "media-codecs.h"
 #include "ssc.h"
+#include "a2dp-codec-ssc.h"
 
 #define SSC_CFG_RATE_48000	0x10
 #define SSC_CFG_RATE_44100	0x20
@@ -49,6 +50,13 @@ static struct spa_log *log_;
 struct impl {
 	ssc_encoder *enc;
 	int preset;
+	int min_preset;
+	int max_preset;
+	int packets_since_reduce;
+	int healthy_queue_packets;
+	int stats_packets;
+	int stats_empty;
+	size_t stats_max_unsent;
 	int rate;
 	bool uhq;
 	int frames_per_packet;
@@ -242,6 +250,9 @@ static void *codec_init(const struct media_codec *codec, uint32_t flags,
 		goto error;
 	}
 	this->preset = preset;
+	this->min_preset = lowest;
+	this->max_preset = preset;
+	this->packets_since_reduce = SSC_ABR_REDUCE_COOLDOWN;
 	this->format = info->info.raw.format;
 	this->block_size = SSC_FRAME_SAMPLES * 2 * sample_size;
 	if (uhq && info->info.raw.rate != 96000) {
@@ -334,6 +345,87 @@ static int codec_encode(void *data, const void *src, size_t src_size,
 	return this->block_size;
 }
 
+static void change_preset(struct impl *this, int preset, const char *reason, size_t unsent)
+{
+	spa_log_info(log_, "SSC: %d -> %d bit/s (%s, %zu bytes queued)",
+			ssc_preset_bitrate(this->preset), ssc_preset_bitrate(preset), reason, unsent);
+	this->preset = preset;
+}
+
+/*
+ * Bitrate adaptation skips the 192k preset: on Galaxy Buds2 Pro it sounds wrong even when it is the only preset of
+ * the stream (tested 2026-11-09), while 229k, 128k, 96k and 88k sound right. It has not been confirmed on any other
+ * earbuds either. It stays reachable as the ceiling when SSC_PRESET=192k asks for it.
+ */
+static int preset_below(const struct impl *this)
+{
+	int preset = this->preset - 1;
+
+	return preset == SSC_PRESET_192K ? preset - 1 : preset;
+}
+
+static int preset_above(const struct impl *this)
+{
+	int preset = this->preset + 1;
+
+	return preset == SSC_PRESET_192K && this->max_preset > SSC_PRESET_192K ? preset + 1 : preset;
+}
+
+static void step_down(struct impl *this, const char *reason, size_t unsent)
+{
+	if (this->preset > this->min_preset)
+		change_preset(this, preset_below(this), reason, unsent);
+	this->packets_since_reduce = 0;
+	this->healthy_queue_packets = 0;
+}
+
+static size_t packet_bytes(const struct impl *this)
+{
+	return sizeof(struct rtp_header) + (size_t)this->frames_per_packet * (size_t)ssc_frame_bytes(this->preset);
+}
+
+static void collect_queue_stats(struct impl *this, size_t unsent)
+{
+	this->stats_max_unsent = SPA_MAX(this->stats_max_unsent, unsent);
+	if (unsent == 0)
+		this->stats_empty++;
+	if (++this->stats_packets < SSC_ABR_INCREASE_HOLD)
+		return;
+	spa_log_debug(log_, "SSC: %d bit/s, last %d packets: queue empty %d times, max %zu bytes (packet %zu bytes)",
+			ssc_preset_bitrate(this->preset), this->stats_packets, this->stats_empty, this->stats_max_unsent, packet_bytes(this));
+	this->stats_packets = 0;
+	this->stats_empty = 0;
+	this->stats_max_unsent = 0;
+}
+
+static int codec_reduce_bitpool(void *data)
+{
+	struct impl *this = data;
+
+	step_down(this, "socket full", 0);
+	return ssc_preset_bitrate(this->preset);
+}
+
+static int codec_abr_process(void *data, size_t unsent)
+{
+	struct impl *this = data;
+
+	collect_queue_stats(this, unsent);
+	if (this->packets_since_reduce < SSC_ABR_REDUCE_COOLDOWN)
+		this->packets_since_reduce++;
+	if (unsent > SSC_ABR_QUEUE_PACKETS * packet_bytes(this)) {
+		this->healthy_queue_packets = 0;
+		if (this->packets_since_reduce >= SSC_ABR_REDUCE_COOLDOWN)
+			step_down(this, "queue growing", unsent);
+	} else if (unsent > packet_bytes(this)) {
+		this->healthy_queue_packets = 0;
+	} else if (this->preset < this->max_preset && ++this->healthy_queue_packets >= SSC_ABR_INCREASE_HOLD) {
+		change_preset(this, preset_above(this), "queue healthy", unsent);
+		this->healthy_queue_packets = 0;
+	}
+	return ssc_preset_bitrate(this->preset);
+}
+
 static void codec_get_delay(void *data, uint32_t *encoder, uint32_t *decoder)
 {
 	if (encoder)
@@ -364,6 +456,8 @@ const struct media_codec a2dp_codec_ssc = {
 	.get_block_size = codec_get_block_size,
 	.start_encode = codec_start_encode,
 	.encode = codec_encode,
+	.abr_process = codec_abr_process,
+	.reduce_bitpool = codec_reduce_bitpool,
 	.get_delay = codec_get_delay,
 	.set_log = codec_set_log,
 };
@@ -385,6 +479,8 @@ const struct media_codec a2dp_codec_ssc_uhq = {
 	.get_block_size = codec_get_block_size,
 	.start_encode = codec_start_encode,
 	.encode = codec_encode,
+	.abr_process = codec_abr_process,
+	.reduce_bitpool = codec_reduce_bitpool,
 	.get_delay = codec_get_delay,
 	.set_log = codec_set_log,
 };

@@ -59,7 +59,8 @@ Reconnect the earbuds afterwards. Check which codec is in use:
     pw-dump | grep '"api.bluez5.codec"'
 
 The plugin offers two profiles per earbud: `ssc` (44.1/48 kHz) and `ssc_uhq` (96 kHz, 24 bit; select it in the sound settings, PipeWire resamples).
-Select a fixed bitrate for experiments with `SSC_PRESET=88k|96k|128k|192k|229k` (or `uhq152k|uhq291k|uhq584k` for UHQ) in WirePlumber's environment.
+The plugin adapts the bitrate to the Bluetooth link. It starts at the highest preset, steps down (229k, 128k, 96k, 88k) when packets pile up in the socket, and steps back up after about 10 seconds with a short queue. It skips 192k, which sounds wrong on Galaxy Buds2 Pro (see NOTES.md). WirePlumber logs each change at info level (`SSC: 229000 -> 128000 bit/s ...`).
+Setting `SSC_PRESET=88k|96k|128k|192k|229k` (or `uhq152k|uhq291k|uhq584k` for UHQ) in WirePlumber's environment caps the bitrate at that preset.
 
 Remove:
 
